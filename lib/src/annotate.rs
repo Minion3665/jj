@@ -301,9 +301,13 @@ fn process_files_in_commits(
     results.load_file_into_cache(store, parent_commit.id(), file_name, &parent_commit.tree()?)?;
 
     let current_contents = results.file_cache.get(current_commit.id()).unwrap();
-    let parent_contents = results.file_cache.get(parent_commit.id()).unwrap();
 
-    let same_lines = get_same_line_map(current_contents, parent_contents);
+    let same_lines = if let Some(parent_contents) = results.file_cache.get(parent_commit.id()) {
+        get_same_line_map(current_contents, parent_contents)
+    } else {
+        HashMap::new()
+    };
+
     for (current_line_no, parent_line_no) in same_lines {
         results.forward_to_new_commit(
             current_commit.id(),
