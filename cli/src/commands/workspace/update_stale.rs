@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use jj_lib::object_id::ObjectId;
 use jj_lib::op_store::OpStoreError;
-use jj_lib::operation::Operation;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo;
 use tracing::instrument;
@@ -126,6 +125,16 @@ fn create_and_check_out_recovery_commit(
             vec![commit_id.clone()],
             commit.tree_id().clone(),
         )
+        .set_description(
+            "RECOVERY COMMIT FROM `jj workspace update-stale`
+
+This commit contains changes that were written to the working copy by an
+operation that was subsequently lost (or was at least unavailable when you ran
+`jj workspace update-stale`). Because the operation was lost, we don't know
+what the parent commits are supposed to be. That means that the diff compared
+to the current parents may contain changes from multiple commits.
+",
+        )
         .write()?;
     mut_repo.set_wc_commit(workspace_id, new_commit.id().clone())?;
     let repo = tx.commit("recovery commit");
@@ -148,18 +157,10 @@ fn for_stale_working_copy(
     command: &CommandHelper,
 ) -> Result<(WorkspaceCommandHelper, bool), CommandError> {
     let workspace = command.load_workspace()?;
-    let op_store = workspace.repo_loader().op_store();
     let (repo, recovered) = {
         let op_id = workspace.working_copy().operation_id();
-        match op_store.read_operation(op_id) {
-            Ok(op_data) => (
-                workspace.repo_loader().load_at(&Operation::new(
-                    op_store.clone(),
-                    op_id.clone(),
-                    op_data,
-                ))?,
-                false,
-            ),
+        match workspace.repo_loader().load_operation(op_id) {
+            Ok(op) => (workspace.repo_loader().load_at(&op)?, false),
             Err(e @ OpStoreError::ObjectNotFound { .. }) => {
                 writeln!(
                     ui.status(),

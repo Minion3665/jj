@@ -90,7 +90,7 @@ impl<T: ContentHash, const N: usize> ContentHash for [T; N] {
 
 impl<T: ContentHash> ContentHash for Vec<T> {
     fn hash(&self, state: &mut impl DigestUpdate) {
-        self.as_slice().hash(state)
+        self.as_slice().hash(state);
     }
 }
 
@@ -106,7 +106,7 @@ impl<T: ContentHash> ContentHash for Option<T> {
             None => state.update(&0u32.to_le_bytes()),
             Some(x) => {
                 state.update(&1u32.to_le_bytes());
-                x.hash(state)
+                x.hash(state);
             }
         }
     }
@@ -147,7 +147,7 @@ where
 {
     fn hash(&self, state: &mut impl DigestUpdate) {
         state.update(&(self.len() as u64).to_le_bytes());
-        for (k, v) in self.iter() {
+        for (k, v) in self {
             k.hash(state);
             v.hash(state);
         }

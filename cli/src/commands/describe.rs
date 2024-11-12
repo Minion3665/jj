@@ -34,12 +34,12 @@ use crate::description_util::ParsedBulkEditMessage;
 use crate::text_util::parse_author;
 use crate::ui::Ui;
 
-/// Update the change description or other metadata
+/// Update the change description or other metadata [aliases: desc]
 ///
 /// Starts an editor to let you edit the description of changes. The editor
 /// will be $EDITOR, or `pico` if that's not defined (`Notepad` on Windows).
 #[derive(clap::Args, Clone, Debug)]
-#[command(visible_aliases = &["desc"])]
+#[command(alias = "desc")]
 pub(crate) struct DescribeArgs {
     /// The revision(s) whose description to edit
     #[arg(default_value = "@")]
@@ -166,8 +166,11 @@ pub(crate) fn cmd_describe(
 
         if let [(_, temp_commit)] = &*temp_commits {
             let template = description_template(ui, &tx, "", temp_commit)?;
-            let description =
-                edit_description(tx.base_workspace_helper(), &template, command.settings())?;
+            let description = edit_description(
+                tx.base_workspace_helper().repo_path(),
+                &template,
+                command.settings(),
+            )?;
 
             vec![(&commits[0], description)]
         } else {

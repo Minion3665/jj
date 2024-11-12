@@ -76,7 +76,7 @@ fn test_duplicate() {
     let (stdout, stderr) = test_env.jj_cmd_ok(&repo_path, &["undo"]);
     insta::assert_snapshot!(stdout, @"");
     insta::assert_snapshot!(stderr, @r#"
-    Undid operation c4b0b2a977fe 2001-02-03 04:05:17.000 +07:00 - 2001-02-03 04:05:17.000 +07:00 duplicate 1 commit(s)
+    Undid operation: b5bdbb51ab28 (2001-02-03 08:05:17) duplicate 1 commit(s)
     "#);
     let (stdout, stderr) = test_env.jj_cmd_ok(&repo_path, &["duplicate" /* duplicates `c` */]);
     insta::assert_snapshot!(stdout, @"");
@@ -280,7 +280,7 @@ fn test_undo_after_duplicate() {
     let (stdout, stderr) = test_env.jj_cmd_ok(&repo_path, &["undo"]);
     insta::assert_snapshot!(stdout, @"");
     insta::assert_snapshot!(stderr, @r#"
-    Undid operation 5a2bcfcdd78b 2001-02-03 04:05:11.000 +07:00 - 2001-02-03 04:05:11.000 +07:00 duplicate 1 commit(s)
+    Undid operation: e3dbefa46ed5 (2001-02-03 08:05:11) duplicate 1 commit(s)
     "#);
     insta::assert_snapshot!(get_log_output(&test_env, &repo_path), @r###"
     @  2443ea76b0b1   a
@@ -329,12 +329,12 @@ fn test_rebase_duplicates() {
 
     let (stdout, stderr) = test_env.jj_cmd_ok(&repo_path, &["rebase", "-s", "b", "-d", "root()"]);
     insta::assert_snapshot!(stdout, @"");
-    insta::assert_snapshot!(stderr, @r###"
-    Rebased 4 commits
+    insta::assert_snapshot!(stderr, @r#"
+    Rebased 4 commits onto destination
     Working copy now at: royxmykx ed671a3c c | c
     Parent commit      : zsuskuln 4c6f1569 b | b
     Added 0 files, modified 0 files, removed 1 files
-    "###);
+    "#);
     // Some of the duplicate commits' timestamps were changed a little to make them
     // have distinct commit ids.
     insta::assert_snapshot!(get_log_output_with_ts(&test_env, &repo_path), @r###"

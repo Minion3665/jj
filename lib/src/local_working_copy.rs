@@ -22,6 +22,7 @@ use std::fs;
 use std::fs::File;
 use std::fs::Metadata;
 use std::fs::OpenOptions;
+use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::iter;
@@ -425,10 +426,14 @@ fn sparse_patterns_from_proto(
 }
 
 /// Creates intermediate directories from the `working_copy_path` to the
-/// `repo_path` parent.
+/// `repo_path` parent. Returns disk path for the `repo_path` file.
 ///
-/// If an intermediate directory exists and if it is a symlink, this function
-/// will return an error. The `working_copy_path` directory may be a symlink.
+/// If an intermediate directory exists and if it is a file or symlink, this
+/// function returns `Ok(None)` to signal that the path should be skipped.
+/// The `working_copy_path` directory may be a symlink.
+///
+/// If an existing or newly-created sub directory points to ".git" or ".jj",
+/// this function returns an error.
 ///
 /// Note that this does not prevent TOCTOU bugs caused by concurrent checkouts.
 /// Another process may remove the directory created by this function and put a
@@ -436,33 +441,144 @@ fn sparse_patterns_from_proto(
 fn create_parent_dirs(
     working_copy_path: &Path,
     repo_path: &RepoPath,
-) -> Result<bool, CheckoutError> {
-    let parent_path = repo_path.parent().expect("repo path shouldn't be root");
+) -> Result<Option<PathBuf>, CheckoutError> {
+    let (parent_path, basename) = repo_path.split().expect("repo path shouldn't be root");
     let mut dir_path = working_copy_path.to_owned();
     for c in parent_path.components() {
-        dir_path.push(c.as_str());
-        match fs::create_dir(&dir_path) {
-            Ok(()) => {}
-            Err(_)
-                if dir_path
-                    .symlink_metadata()
-                    .map(|m| m.is_dir())
-                    .unwrap_or(false) => {}
-            Err(err) => {
-                if dir_path.is_file() {
-                    return Ok(true);
+        // Ensure that the name is a normal entry of the current dir_path.
+        dir_path.push(c.to_fs_name().map_err(|err| err.with_path(repo_path))?);
+        // A directory named ".git" or ".jj" can be temporarily created. It
+        // might trick workspace path discovery, but is harmless so long as the
+        // directory is empty.
+        let new_dir_created = match fs::create_dir(&dir_path) {
+            Ok(()) => true, // New directory
+            Err(err) => match dir_path.symlink_metadata() {
+                Ok(m) if m.is_dir() => false, // Existing directory
+                Ok(_) => {
+                    return Ok(None); // Skip existing file or symlink
                 }
+                Err(_) => {
+                    return Err(CheckoutError::Other {
+                        message: format!(
+                            "Failed to create parent directories for {}",
+                            repo_path.to_fs_path_unchecked(working_copy_path).display(),
+                        ),
+                        err: err.into(),
+                    })
+                }
+            },
+        };
+        // Invalid component (e.g. "..") should have been rejected.
+        // The current dir_path should be an entry of dir_path.parent().
+        reject_reserved_existing_path(&dir_path).inspect_err(|_| {
+            if new_dir_created {
+                fs::remove_dir(&dir_path).ok();
+            }
+        })?;
+    }
+
+    let mut file_path = dir_path;
+    file_path.push(
+        basename
+            .to_fs_name()
+            .map_err(|err| err.with_path(repo_path))?,
+    );
+    Ok(Some(file_path))
+}
+
+/// Removes existing file named `disk_path` if any. Returns `Ok(true)` if the
+/// file was there and got removed, meaning that new file can be safely created.
+///
+/// If the existing file points to ".git" or ".jj", this function returns an
+/// error.
+fn remove_old_file(disk_path: &Path) -> Result<bool, CheckoutError> {
+    reject_reserved_existing_path(disk_path)?;
+    match fs::remove_file(disk_path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        // TODO: Use io::ErrorKind::IsADirectory if it gets stabilized
+        Err(_) if disk_path.symlink_metadata().is_ok_and(|m| m.is_dir()) => Ok(false),
+        Err(err) => Err(CheckoutError::Other {
+            message: format!("Failed to remove file {}", disk_path.display()),
+            err: err.into(),
+        }),
+    }
+}
+
+/// Checks if new file or symlink named `disk_path` can be created.
+///
+/// If the file already exists, this function return `Ok(false)` to signal
+/// that the path should be skipped.
+///
+/// If the path may point to ".git" or ".jj" entry, this function returns an
+/// error.
+///
+/// This function can fail if `disk_path.parent()` isn't a directory.
+fn can_create_new_file(disk_path: &Path) -> Result<bool, CheckoutError> {
+    // New file or symlink will be created by caller. If it were pointed to by
+    // name ".git" or ".jj", git/jj CLI could be tricked to load configuration
+    // from an attacker-controlled location. So we first test the path by
+    // creating an empty file.
+    let new_file_created = match OpenOptions::new()
+        .write(true)
+        .create_new(true) // Don't overwrite, don't follow symlink
+        .open(disk_path)
+    {
+        Ok(_) => true,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => false,
+        // Workaround for "Access is denied. (os error 5)" error on Windows.
+        Err(_) => match disk_path.symlink_metadata() {
+            Ok(_) => false,
+            Err(err) => {
                 return Err(CheckoutError::Other {
-                    message: format!(
-                        "Failed to create parent directories for {}",
-                        repo_path.to_fs_path(working_copy_path).display(),
-                    ),
+                    message: format!("Failed to stat {}", disk_path.display()),
+                    err: err.into(),
+                })
+            }
+        },
+    };
+    reject_reserved_existing_path(disk_path).inspect_err(|_| {
+        if new_file_created {
+            fs::remove_file(disk_path).ok();
+        }
+    })?;
+    if new_file_created {
+        fs::remove_file(disk_path).map_err(|err| CheckoutError::Other {
+            message: format!("Failed to remove temporary file {}", disk_path.display()),
+            err: err.into(),
+        })?;
+    }
+    Ok(new_file_created)
+}
+
+const RESERVED_DIR_NAMES: &[&str] = &[".git", ".jj"];
+
+/// Suppose the `disk_path` exists, checks if the last component points to
+/// ".git" or ".jj" in the same parent directory.
+fn reject_reserved_existing_path(disk_path: &Path) -> Result<(), CheckoutError> {
+    let parent_dir_path = disk_path.parent().expect("content path shouldn't be root");
+    for name in RESERVED_DIR_NAMES {
+        let reserved_path = parent_dir_path.join(name);
+        match same_file::is_same_file(disk_path, &reserved_path) {
+            Ok(true) => {
+                return Err(CheckoutError::ReservedPathComponent {
+                    path: disk_path.to_owned(),
+                    name,
+                });
+            }
+            Ok(false) => {}
+            // If the existing disk_path pointed to the reserved path, the
+            // reserved path would exist.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(CheckoutError::Other {
+                    message: format!("Failed to validate path {}", disk_path.display()),
                     err: err.into(),
                 });
             }
         }
     }
-    Ok(false)
+    Ok(())
 }
 
 fn mtime_from_metadata(metadata: &Metadata) -> MillisSinceEpoch {
@@ -523,25 +639,16 @@ struct DirectoryToVisit<'a> {
 #[derive(Debug, Error)]
 pub enum TreeStateError {
     #[error("Reading tree state from {path}")]
-    ReadTreeState {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    ReadTreeState { path: PathBuf, source: io::Error },
     #[error("Decoding tree state from {path}")]
     DecodeTreeState {
         path: PathBuf,
         source: prost::DecodeError,
     },
     #[error("Writing tree state to temporary file {path}")]
-    WriteTreeState {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    WriteTreeState { path: PathBuf, source: io::Error },
     #[error("Persisting tree state to file {path}")]
-    PersistTreeState {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    PersistTreeState { path: PathBuf, source: io::Error },
     #[error("Filesystem monitor error")]
     Fsmonitor(#[source] Box<dyn Error + Send + Sync>),
 }
@@ -599,7 +706,7 @@ impl TreeState {
     ) -> Result<TreeState, TreeStateError> {
         let tree_state_path = state_path.join("tree_state");
         let file = match File::open(&tree_state_path) {
-            Err(ref err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(ref err) if err.kind() == io::ErrorKind::NotFound => {
                 return TreeState::init(store, working_copy_path, state_path);
             }
             Err(err) => {
@@ -953,7 +1060,7 @@ impl TreeState {
                         path: file_name.clone(),
                     })?;
 
-                if name == ".jj" || name == ".git" {
+                if RESERVED_DIR_NAMES.contains(&name) {
                     return Ok(());
                 }
                 let path = dir.join(RepoPathComponent::new(name));
@@ -978,10 +1085,10 @@ impl TreeState {
                             if !matcher.matches(tracked_path) {
                                 continue;
                             }
-                            let disk_path = tracked_path.to_fs_path(&self.working_copy_path);
+                            let disk_path = tracked_path.to_fs_path(&self.working_copy_path)?;
                             let metadata = match disk_path.symlink_metadata() {
                                 Ok(metadata) => metadata,
-                                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                Err(err) if err.kind() == io::ErrorKind::NotFound => {
                                     continue;
                                 }
                                 Err(err) => {
@@ -1265,7 +1372,7 @@ impl TreeState {
                 message: format!("Failed to open file {} for writing", disk_path.display()),
                 err: err.into(),
             })?;
-        let size = std::io::copy(contents, &mut file).map_err(|err| CheckoutError::Other {
+        let size = io::copy(contents, &mut file).map_err(|err| CheckoutError::Other {
             message: format!("Failed to write file {}", disk_path.display()),
             err: err.into(),
         })?;
@@ -1404,7 +1511,7 @@ impl TreeState {
                     match values {
                         Ok((before, after)) => {
                             let result = materialize_tree_value(&self.store, &path, after).await;
-                            (path, result.map(|value| (before.is_present(), value)))
+                            (path, result.map(|value| (before, value)))
                         }
                         Err(err) => (path, Err(err)),
                     }
@@ -1412,31 +1519,47 @@ impl TreeState {
                 .buffered(self.store.concurrency().max(1)),
         );
         while let Some((path, data)) = diff_stream.next().await {
-            let (present_before, after) = data?;
+            let (before, after) = data?;
             if after.is_absent() {
                 stats.removed_files += 1;
-            } else if !present_before {
+            } else if before.is_absent() {
                 stats.added_files += 1;
             } else {
                 stats.updated_files += 1;
             }
-            let disk_path = path.to_fs_path(&self.working_copy_path);
 
-            if present_before {
-                fs::remove_file(&disk_path).ok();
-            } else if disk_path.exists() {
+            // Existing Git submodule can be a non-empty directory on disk. We
+            // shouldn't attempt to manage it as a tracked path.
+            //
+            // TODO: It might be better to add general support for paths not
+            // tracked by jj than processing submodules specially. For example,
+            // paths excluded by .gitignore can be marked as such so that
+            // newly-"unignored" paths won't be snapshotted automatically.
+            if matches!(before.as_normal(), Some(TreeValue::GitSubmodule(_)))
+                && matches!(after, MaterializedTreeValue::GitSubmodule(_))
+            {
+                eprintln!("ignoring git submodule at {path:?}");
+                // Not updating the file state as if there were no diffs. Leave
+                // the state type as FileType::GitSubmodule if it was before.
+                continue;
+            }
+
+            // Create parent directories no matter if after.is_present(). This
+            // ensures that the path never traverses symlinks.
+            let Some(disk_path) = create_parent_dirs(&self.working_copy_path, &path)? else {
+                changed_file_states.push((path, FileState::placeholder()));
+                stats.skipped_files += 1;
+                continue;
+            };
+            // If the path was present, check reserved path first and delete it.
+            let present_file_deleted = before.is_present() && remove_old_file(&disk_path)?;
+            // If not, create temporary file to test the path validity.
+            if !present_file_deleted && !can_create_new_file(&disk_path)? {
                 changed_file_states.push((path, FileState::placeholder()));
                 stats.skipped_files += 1;
                 continue;
             }
-            if after.is_present() {
-                let skip = create_parent_dirs(&self.working_copy_path, &path)?;
-                if skip {
-                    changed_file_states.push((path, FileState::placeholder()));
-                    stats.skipped_files += 1;
-                    continue;
-                }
-            }
+
             // TODO: Check that the file has not changed before overwriting/removing it.
             let file_state = match after {
                 MaterializedTreeValue::Absent | MaterializedTreeValue::AccessDenied(_) => {
@@ -1557,7 +1680,7 @@ impl TreeState {
     }
 }
 
-fn checkout_error_for_stat_error(err: std::io::Error, path: &Path) -> CheckoutError {
+fn checkout_error_for_stat_error(err: io::Error, path: &Path) -> CheckoutError {
     CheckoutError::Other {
         message: format!("Failed to stat file {}", path.display()),
         err: err.into(),

@@ -17,7 +17,6 @@ use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::env;
-use std::env::ArgsOs;
 use std::env::VarError;
 use std::ffi::OsString;
 use std::fmt;
@@ -64,7 +63,6 @@ use jj_lib::git;
 use jj_lib::git_backend::GitBackend;
 use jj_lib::gitignore::GitIgnoreError;
 use jj_lib::gitignore::GitIgnoreFile;
-use jj_lib::hex_util::to_reverse_hex;
 use jj_lib::id_prefix::IdPrefixContext;
 use jj_lib::matchers::Matcher;
 use jj_lib::merge::MergedTreeValue;
@@ -92,6 +90,7 @@ use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::repo_path::RepoPathUiConverter;
 use jj_lib::repo_path::UiPathParseError;
 use jj_lib::revset;
+use jj_lib::revset::ResolvedRevsetExpression;
 use jj_lib::revset::RevsetAliasesMap;
 use jj_lib::revset::RevsetDiagnostics;
 use jj_lib::revset::RevsetExpression;
@@ -103,6 +102,7 @@ use jj_lib::revset::RevsetModifier;
 use jj_lib::revset::RevsetParseContext;
 use jj_lib::revset::RevsetWorkspaceContext;
 use jj_lib::revset::SymbolResolverExtension;
+use jj_lib::revset::UserRevsetExpression;
 use jj_lib::rewrite::restore_tree;
 use jj_lib::settings::ConfigResultExt as _;
 use jj_lib::settings::UserSettings;
@@ -254,7 +254,7 @@ impl TracingSubscription {
             .modify(|filter| {
                 *filter = tracing_subscriber::EnvFilter::builder()
                     .with_default_directive(tracing::metadata::LevelFilter::DEBUG.into())
-                    .from_env_lossy()
+                    .from_env_lossy();
             })
             .map_err(|err| internal_error_with_message("failed to enable debug logging", err))?;
         tracing::info!("debug logging enabled");
@@ -382,6 +382,7 @@ impl CommandHelper {
         let op_head = self.resolve_operation(ui, workspace.repo_loader())?;
         let repo = workspace.repo_loader().load_at(&op_head)?;
         let env = self.workspace_environment(ui, &workspace)?;
+        revset_util::warn_unresolvable_trunk(ui, repo.as_ref(), &env.revset_parse_context())?;
         WorkspaceCommandHelper::new(ui, workspace, repo, env, self.is_at_head_operation())
     }
 
@@ -522,13 +523,15 @@ impl ReadonlyUserRepo {
     }
 }
 
-/// A bookmark that should be advanced to satisfy the "advance-bookmarks"
-/// feature. This is a helper for `WorkspaceCommandTransaction`. It provides a
-/// type-safe way to separate the work of checking whether a bookmark can be
-/// advanced and actually advancing it. Advancing the bookmark never fails, but
-/// can't be done until the new `CommitId` is available. Splitting the work in
-/// this way also allows us to identify eligible bookmarks without actually
-/// moving them and return config errors to the user early.
+/// A advanceable bookmark to satisfy the "advance-bookmarks" feature.
+///
+/// This is a helper for `WorkspaceCommandTransaction`. It provides a
+/// type-safe way to separate the work of checking whether a bookmark
+/// can be advanced and actually advancing it. Advancing the bookmark
+/// never fails, but can't be done until the new `CommitId` is
+/// available. Splitting the work in this way also allows us to
+/// identify eligible bookmarks without actually moving them and
+/// return config errors to the user early.
 pub struct AdvanceableBookmark {
     name: String,
     old_commit_id: CommitId,
@@ -602,8 +605,8 @@ pub struct WorkspaceCommandEnvironment {
     template_aliases_map: TemplateAliasesMap,
     path_converter: RepoPathUiConverter,
     workspace_id: WorkspaceId,
-    immutable_heads_expression: Rc<RevsetExpression>,
-    short_prefixes_expression: Option<Rc<RevsetExpression>>,
+    immutable_heads_expression: Rc<UserRevsetExpression>,
+    short_prefixes_expression: Option<Rc<UserRevsetExpression>>,
 }
 
 impl WorkspaceCommandEnvironment {
@@ -674,21 +677,21 @@ impl WorkspaceCommandEnvironment {
     }
 
     /// User-configured expression defining the immutable set.
-    pub fn immutable_expression(&self) -> Rc<RevsetExpression> {
+    pub fn immutable_expression(&self) -> Rc<UserRevsetExpression> {
         // Negated ancestors expression `~::(<heads> | root())` is slightly
         // easier to optimize than negated union `~(::<heads> | root())`.
         self.immutable_heads_expression.ancestors()
     }
 
     /// User-configured expression defining the heads of the immutable set.
-    pub fn immutable_heads_expression(&self) -> &Rc<RevsetExpression> {
+    pub fn immutable_heads_expression(&self) -> &Rc<UserRevsetExpression> {
         &self.immutable_heads_expression
     }
 
     fn load_immutable_heads_expression(
         &self,
         ui: &Ui,
-    ) -> Result<Rc<RevsetExpression>, CommandError> {
+    ) -> Result<Rc<UserRevsetExpression>, CommandError> {
         let mut diagnostics = RevsetDiagnostics::new();
         let expression = revset_util::parse_immutable_heads_expression(
             &mut diagnostics,
@@ -702,7 +705,7 @@ impl WorkspaceCommandEnvironment {
     fn load_short_prefixes_expression(
         &self,
         ui: &Ui,
-    ) -> Result<Option<Rc<RevsetExpression>>, CommandError> {
+    ) -> Result<Option<Rc<UserRevsetExpression>>, CommandError> {
         let revset_string = self
             .settings()
             .config()
@@ -720,25 +723,18 @@ impl WorkspaceCommandEnvironment {
             .map_err(|err| config_error_with_message("Invalid `revsets.short-prefixes`", err))?;
             print_parse_diagnostics(ui, "In `revsets.short-prefixes`", &diagnostics)?;
             let (None | Some(RevsetModifier::All)) = modifier;
-            Ok(Some(revset::optimize(expression)))
+            Ok(Some(expression))
         }
     }
 
-    fn check_repo_rewritable<'a>(
+    fn find_immutable_commit<'a>(
         &self,
         repo: &dyn Repo,
         commits: impl IntoIterator<Item = &'a CommitId>,
-    ) -> Result<(), CommandError> {
+    ) -> Result<Option<CommitId>, CommandError> {
         if self.command.global_args().ignore_immutable {
             let root_id = repo.store().root_commit_id();
-            return if commits.into_iter().contains(root_id) {
-                Err(user_error(format!(
-                    "The root commit {} is immutable",
-                    short_commit_hash(root_id),
-                )))
-            } else {
-                Ok(())
-            };
+            return Ok(commits.into_iter().find(|id| *id == root_id).cloned());
         }
 
         // Not using self.id_prefix_context() because the disambiguation data
@@ -758,24 +754,7 @@ impl WorkspaceCommandEnvironment {
         let mut commit_id_iter = expression.evaluate_to_commit_ids().map_err(|e| {
             config_error_with_message("Invalid `revset-aliases.immutable_heads()`", e)
         })?;
-
-        if let Some(commit_id) = commit_id_iter.next() {
-            let error = if &commit_id == repo.store().root_commit_id() {
-                user_error(format!(
-                    "The root commit {} is immutable",
-                    short_commit_hash(&commit_id),
-                ))
-            } else {
-                user_error_with_hint(
-                    format!("Commit {} is immutable", short_commit_hash(&commit_id)),
-                    "Pass `--ignore-immutable` or configure the set of immutable commits via \
-                     `revset-aliases.immutable_heads()`.",
-                )
-            };
-            return Err(error);
-        }
-
-        Ok(())
+        Ok(commit_id_iter.next().transpose()?)
     }
 
     /// Parses template of the given language into evaluation tree.
@@ -1370,7 +1349,7 @@ impl WorkspaceCommandHelper {
 
     pub fn attach_revset_evaluator(
         &self,
-        expression: Rc<RevsetExpression>,
+        expression: Rc<UserRevsetExpression>,
     ) -> RevsetExpressionEvaluator<'_> {
         RevsetExpressionEvaluator::new(
             self.repo().as_ref(),
@@ -1489,6 +1468,7 @@ impl WorkspaceCommandHelper {
             &self.op_summary_template_text,
             OperationTemplateLanguage::wrap_operation,
         )
+        .labeled("operation")
     }
 
     pub fn short_change_id_template(&self) -> TemplateRenderer<'_, Commit> {
@@ -1528,8 +1508,29 @@ impl WorkspaceCommandHelper {
         &self,
         commits: impl IntoIterator<Item = &'a CommitId>,
     ) -> Result<(), CommandError> {
-        self.env
-            .check_repo_rewritable(self.repo().as_ref(), commits)
+        let Some(commit_id) = self
+            .env
+            .find_immutable_commit(self.repo().as_ref(), commits)?
+        else {
+            return Ok(());
+        };
+        let error = if &commit_id == self.repo().store().root_commit_id() {
+            user_error(format!("The root commit {commit_id:.12} is immutable"))
+        } else {
+            let mut error = user_error(format!("Commit {commit_id:.12} is immutable"));
+            let commit = self.repo().store().get_commit(&commit_id)?;
+            error.add_formatted_hint_with(|formatter| {
+                write!(formatter, "Could not modify commit: ")?;
+                self.write_commit_summary(formatter, &commit)?;
+                Ok(())
+            });
+            error.add_hint(
+                "Pass `--ignore-immutable` or configure the set of immutable commits via \
+                 `revset-aliases.immutable_heads()`.",
+            );
+            error
+        };
+        Err(error)
     }
 
     #[instrument(skip_all)]
@@ -1716,8 +1717,8 @@ See https://martinvonz.github.io/jj/latest/working-copy/#stale-working-copy \
         {
             if self
                 .env
-                .check_repo_rewritable(tx.repo(), [wc_commit_id])
-                .is_err()
+                .find_immutable_commit(tx.repo(), [wc_commit_id])?
+                .is_some()
             {
                 let wc_commit = tx.repo().store().get_commit(wc_commit_id)?;
                 tx.repo_mut()
@@ -1825,14 +1826,15 @@ See https://martinvonz.github.io/jj/latest/working-copy/#stale-working-copy \
         let removed_conflicts_expr = new_heads.range(&old_heads).intersection(&conflicts);
         let added_conflicts_expr = old_heads.range(&new_heads).intersection(&conflicts);
 
-        let get_commits = |expr: Rc<RevsetExpression>| -> Result<Vec<Commit>, CommandError> {
-            let commits = expr
-                .evaluate_programmatic(new_repo)?
-                .iter()
-                .commits(new_repo.store())
-                .try_collect()?;
-            Ok(commits)
-        };
+        let get_commits =
+            |expr: Rc<ResolvedRevsetExpression>| -> Result<Vec<Commit>, CommandError> {
+                let commits = expr
+                    .evaluate(new_repo)?
+                    .iter()
+                    .commits(new_repo.store())
+                    .try_collect()?;
+                Ok(commits)
+            };
         let removed_conflict_commits = get_commits(removed_conflicts_expr)?;
         let added_conflict_commits = get_commits(added_conflicts_expr)?;
 
@@ -1920,7 +1922,7 @@ See https://martinvonz.github.io/jj/latest/working-copy/#stale-working-copy \
         let only_one_conflicted_commit = conflicted_commits.len() == 1;
         let root_conflicts_revset = RevsetExpression::commits(conflicted_commits)
             .roots()
-            .evaluate_programmatic(repo)?;
+            .evaluate(repo)?;
 
         let root_conflict_commits: Vec<_> = root_conflicts_revset
             .iter()
@@ -1999,7 +2001,8 @@ Then run `jj squash` to move the resolution into the conflicted commit."#,
     }
 }
 
-/// A [`Transaction`] tied to a particular workspace.
+/// An ongoing [`Transaction`] tied to a particular workspace.
+///
 /// `WorkspaceCommandTransaction`s are created with
 /// [`WorkspaceCommandHelper::start_transaction`] and committed with
 /// [`WorkspaceCommandTransaction::finish`]. The inner `Transaction` can also be
@@ -2131,7 +2134,7 @@ impl WorkspaceCommandTransaction<'_> {
     }
 }
 
-fn find_workspace_dir(cwd: &Path) -> &Path {
+pub fn find_workspace_dir(cwd: &Path) -> &Path {
     cwd.ancestors()
         .find(|path| path.join(".jj").is_dir())
         .unwrap_or(cwd)
@@ -2237,14 +2240,7 @@ pub fn check_stale_working_copy(
         // The working copy isn't stale, and no need to reload the repo.
         Ok(WorkingCopyFreshness::Fresh)
     } else {
-        let wc_operation_data = repo
-            .op_store()
-            .read_operation(locked_wc.old_operation_id())?;
-        let wc_operation = Operation::new(
-            repo.op_store().clone(),
-            locked_wc.old_operation_id().clone(),
-            wc_operation_data,
-        );
+        let wc_operation = repo.loader().load_operation(locked_wc.old_operation_id())?;
         let repo_operation = repo.operation();
         let ancestor_op = dag_walk::closest_common_node_ok(
             [Ok(wc_operation.clone())],
@@ -2650,17 +2646,15 @@ pub fn edit_temp_file(
 }
 
 pub fn short_commit_hash(commit_id: &CommitId) -> String {
-    commit_id.hex()[0..12].to_string()
+    format!("{commit_id:.12}")
 }
 
 pub fn short_change_hash(change_id: &ChangeId) -> String {
-    // TODO: We could avoid the unwrap() and make this more efficient by converting
-    // straight from binary.
-    to_reverse_hex(&change_id.hex()[0..12]).unwrap()
+    format!("{change_id:.12}")
 }
 
 pub fn short_operation_hash(operation_id: &OperationId) -> String {
-    operation_id.hex()[0..12].to_string()
+    format!("{operation_id:.12}")
 }
 
 /// Wrapper around a `DiffEditor` to conditionally start interactive session.
@@ -2837,7 +2831,7 @@ pub struct EarlyArgs {
     pub color: Option<ColorChoice>,
     /// Silence non-primary command output
     ///
-    /// For example, `jj file list ` will still list files, but it won't tell
+    /// For example, `jj file list` will still list files, but it won't tell
     /// you if the working copy was snapshotted or if descendants were rebased.
     ///
     /// Warnings and errors will still be printed.
@@ -2846,7 +2840,7 @@ pub struct EarlyArgs {
     // Option<bool>.
     pub quiet: Option<bool>,
     /// Disable the pager
-    #[arg(long, value_name = "WHEN", global = true, action = ArgAction::SetTrue)]
+    #[arg(long, global = true, action = ArgAction::SetTrue)]
     // Parsing with ignore_errors will crash if this is bool, so use
     // Option<bool>.
     pub no_pager: Option<bool>,
@@ -2912,7 +2906,7 @@ fn resolve_default_command(
     app: &Command,
     mut string_args: Vec<String>,
 ) -> Result<Vec<String>, CommandError> {
-    const PRIORITY_FLAGS: &[&str] = &["help", "--help", "-h", "--version", "-V"];
+    const PRIORITY_FLAGS: &[&str] = &["--help", "-h", "--version", "-V"];
 
     let has_priority_flag = string_args
         .iter()
@@ -3036,8 +3030,16 @@ fn handle_early_args(
     let early_matches = app
         .clone()
         .disable_version_flag(true)
+        // Do not emit DisplayHelp error
         .disable_help_flag(true)
-        .disable_help_subcommand(true)
+        // Do not stop parsing at -h/--help
+        .arg(
+            clap::Arg::new("help")
+                .short('h')
+                .long("help")
+                .global(true)
+                .action(ArgAction::Count),
+        )
         .ignore_errors(true)
         .try_get_matches_from(args)?;
     let mut args: EarlyArgs = EarlyArgs::from_arg_matches(&early_matches).unwrap();
@@ -3058,10 +3060,38 @@ fn handle_early_args(
     Ok(())
 }
 
+fn handle_shell_completion(
+    ui: &Ui,
+    app: &Command,
+    config: &config::Config,
+    cwd: &Path,
+) -> Result<(), CommandError> {
+    let mut args = vec![];
+    // Take the first two arguments as is, they must be passed to clap_complete
+    // without any changes. They are usually "jj --".
+    args.extend(env::args_os().take(2));
+
+    if env::args_os().nth(2).is_some() {
+        // Make sure aliases are expanded before passing them to
+        // clap_complete. We skip the first two args ("jj" and "--") for
+        // alias resolution, then we stitch the args back together, like
+        // clap_complete expects them.
+        let resolved_aliases = expand_args(ui, app, env::args_os().skip(2), config)?;
+        args.extend(resolved_aliases.into_iter().map(OsString::from));
+    }
+    let ran_completion = clap_complete::CompleteEnv::with_factory(|| app.clone())
+        .try_complete(args.iter(), Some(cwd))?;
+    assert!(
+        ran_completion,
+        "This function should not be called without the COMPLETE variable set."
+    );
+    Ok(())
+}
+
 pub fn expand_args(
     ui: &Ui,
     app: &Command,
-    args_os: ArgsOs,
+    args_os: impl IntoIterator<Item = OsString>,
     config: &config::Config,
 ) -> Result<Vec<String>, CommandError> {
     let mut string_args: Vec<String> = vec![];
@@ -3311,8 +3341,12 @@ impl CliRunner {
                 .flatten()
                 .map(|path| format!("- {}", path.display()))
                 .join("\n");
-            e.hinted(format!("Check the following config files:\n{}", paths))
+            e.hinted(format!("Check the following config files:\n{paths}"))
         })?;
+
+        if env::var_os("COMPLETE").is_some() {
+            return handle_shell_completion(ui, &self.app, &config, &cwd);
+        }
 
         let string_args = expand_args(ui, &self.app, env::args_os(), &config)?;
         let (matches, args) = parse_args(

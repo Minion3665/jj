@@ -21,6 +21,7 @@ use jj_lib::backend::CommitId;
 use jj_lib::commit::CommitIteratorExt;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo;
+use jj_lib::revset::ResolvedRevsetExpression;
 use jj_lib::revset::RevsetExpression;
 use jj_lib::revset::RevsetIteratorExt;
 use jj_lib::rewrite::merge_commit_trees;
@@ -51,9 +52,10 @@ pub(crate) struct NewArgs {
     /// Parent(s) of the new change
     #[arg(default_value = "@")]
     pub(crate) revisions: Vec<RevisionArg>,
-    /// Ignored (but lets you pass `-r` for consistency with other commands)
-    #[arg(short = 'r', hide = true, action = clap::ArgAction::Count)]
-    unused_revision: u8,
+    /// Ignored (but lets you pass `-d`/`-r` for consistency with other
+    /// commands)
+    #[arg(short = 'd', hide = true, short_alias = 'r',  action = clap::ArgAction::Count)]
+    unused_destination: u8,
     /// The change description to use
     #[arg(long = "message", short, value_name = "MESSAGE")]
     message_paragraphs: Vec<String>,
@@ -156,7 +158,7 @@ pub(crate) fn cmd_new(
             .children()
             .minus(&parents_expression.ancestors());
         children_commits = children_expression
-            .evaluate_programmatic(workspace_command.repo().as_ref())?
+            .evaluate(workspace_command.repo().as_ref())?
             .iter()
             .commits(workspace_command.repo().store())
             .try_collect()?;
@@ -233,15 +235,16 @@ pub(crate) fn cmd_new(
 /// parents of the new commit.
 fn ensure_no_commit_loop(
     repo: &ReadonlyRepo,
-    children_expression: &Rc<RevsetExpression>,
-    parents_expression: &Rc<RevsetExpression>,
+    children_expression: &Rc<ResolvedRevsetExpression>,
+    parents_expression: &Rc<ResolvedRevsetExpression>,
 ) -> Result<(), CommandError> {
     if let Some(commit_id) = children_expression
         .dag_range_to(parents_expression)
-        .evaluate_programmatic(repo)?
+        .evaluate(repo)?
         .iter()
         .next()
     {
+        let commit_id = commit_id?;
         return Err(user_error(format!(
             "Refusing to create a loop: commit {} would be both an ancestor and a descendant of \
              the new commit",
